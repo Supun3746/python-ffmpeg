@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
 import io
 import os
 import signal
 import subprocess
-from typing import IO, Optional, Union
+from typing import Optional, Union, AsyncIterable
 
-from pyee import EventEmitter
+from pyee.asyncio import AsyncIOEventEmitter
 from typing_extensions import Self
 
 from ffmpeg import types
-from ffmpeg.errors import FFmpegAlreadyExecuted, FFmpegError
+from ffmpeg.asyncio.utils import create_subprocess, ensure_stream_reader, read_stream, readlines
+from ffmpeg.ffmpeg import FFmpegAlreadyExecuted, FFmpegError
 from ffmpeg.options import Options
 from ffmpeg.progress import Tracker
-from ffmpeg.utils import create_subprocess, ensure_io, is_windows, read_stream, readlines
+from ffmpeg.utils import is_windows
 
 
-class FFmpeg(EventEmitter):
+class FFmpeg(AsyncIOEventEmitter):
     def __init__(self, executable: str = "ffmpeg"):
-        """Initialize an `FFmpeg` instance.
+        """Initialize an `FFmpeg` instance using `asyncio`
 
         Args:
             executable: The path to the ffmpeg executable. Defaults to "ffmpeg".
@@ -29,11 +30,14 @@ class FFmpeg(EventEmitter):
         self._executable: str = executable
         self._options: Options = Options()
 
-        self._process: subprocess.Popen[bytes]
+        self._process: asyncio.subprocess.Process
         self._executed: bool = False
         self._terminated: bool = False
-
+        self._tasks = {}
+        
         self._tracker = Tracker(self)  # type: ignore
+
+        self.once("error", self._reraise_exception)
 
     @property
     def arguments(self) -> list[str]:
@@ -143,67 +147,88 @@ class FFmpeg(EventEmitter):
         self._options.output(url, options, **kwargs)
         return self
 
-    def execute(self, stream: Optional[Union[bytes, IO[bytes]]] = None, timeout: Optional[float] = None) -> bytes:
-        """Execute FFmpeg using specified global options and files.
-
-        Args:
-            stream: A stream to input to the standard input. Defaults to None.
-            timeout: The maximum number of seconds to wait before returning. Defaults to None.
-
-        Raises:
-            FFmpegAlreadyExecuted: If FFmpeg is already executed.
-            FFmpegError: If FFmpeg process returns non-zero exit status.
-            subprocess.TimeoutExpired: If FFmpeg process does not terminate after `timeout` seconds.
-
-        Returns:
-            The output to the standard output.
-        """
+    async def _start_execution(self, stream: Optional[Union[bytes, asyncio.StreamReader]] = None):
         if self._executed:
             raise FFmpegAlreadyExecuted("FFmpeg is already executed", arguments=self.arguments)
 
         self._executed = False
         self._terminated = False
-
-        if stream is not None:
-            stream = ensure_io(stream)
+        
 
         self.emit("start", self.arguments)
 
-        self._process = create_subprocess(
-            self.arguments,
-            bufsize=0,
+        self._process = await create_subprocess(
+            *self.arguments,
             stdin=subprocess.PIPE if stream is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            self._executed = True
-            futures = [
-                executor.submit(self._write_stdin, stream),
-                executor.submit(self._read_stdout),
-                executor.submit(self._handle_stderr),
-                executor.submit(self._process.wait, timeout),
-            ]
-            done, pending = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_EXCEPTION)
-            self._executed = False
+        self._executed = True
+    async def _wait_for_execution(self):
+        done, pending = await asyncio.wait(self._tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
+        self._executed = False
 
-            for future in done:
-                exception = future.exception()
-                if exception is not None:
-                    self._process.terminate()
-                    concurrent.futures.wait(pending)
+        for task in done:
+            exception = task.exception()
+            if exception is not None:
+                self._process.terminate()
+                for task in pending:
+                    await task
 
-                    raise exception
+                raise exception
 
         if self._process.returncode == 0:
             self.emit("completed")
         elif self._terminated:
             self.emit("terminated")
         else:
-            raise FFmpegError.create(message=futures[2].result(), arguments=self.arguments)
+            FFmpegError.create(message=self._tasks["stderr"].result(), arguments=self.arguments)
 
-        return futures[1].result()
+    async def execute(
+            self, stream: Optional[Union[bytes, asyncio.StreamReader]] = None, timeout: Optional[float] = None,
+    ) -> bytes:
+        """Execute FFmpeg using specified global options and files.
+        Args:
+            stream: A stream to input to the standard input. Defaults to None.
+            timeout: The maximum number of seconds to wait before returning. Defaults to None.
+        Raises:
+            FFmpegAlreadyExecuted: If FFmpeg is already executed.
+            FFmpegError: If FFmpeg process returns non-zero exit status.
+            asyncio.TimeoutError: If FFmpeg process does not terminate after `timeout` seconds.
+        Returns:
+            The output to the standard output.
+        """
+        if stream is not None:
+            stream = ensure_stream_reader(stream)
+        await self._start_execution(stream=stream)
+
+        self._tasks = {
+            "stdin": asyncio.create_task(self._write_stdin(stream)),
+            "stdout": asyncio.create_task(self._read_stdout()),
+            "stderr": asyncio.create_task(self._handle_stderr()),
+            "main": asyncio.create_task(asyncio.wait_for(self._process.wait(), timeout=timeout)),
+        }
+
+        await self._wait_for_execution()
+        return self._tasks["stdout"].result()
+
+    async def execute_stream_stdout(
+            self, stream: Optional[Union[bytes, asyncio.StreamReader]] = None, timeout: Optional[float] = None,
+            *, stream_chunk_size=io.DEFAULT_BUFFER_SIZE
+    ) -> AsyncIterable[bytes]:
+        """Like `execute`, but returns a generator of bytes, so you can read the output as it starts to come out."""
+        if stream is not None:
+            stream = ensure_stream_reader(stream)
+        await self._start_execution(stream=stream)
+        self._tasks = {
+            "stdin": asyncio.create_task(self._write_stdin(stream)),
+            "stderr": asyncio.create_task(self._handle_stderr()),
+            "main": asyncio.create_task(asyncio.wait_for(self._process.wait(), timeout=timeout)),
+        }
+        async for chunk in read_stream(self._process.stdout, size=stream_chunk_size):
+            yield chunk
+        await self._wait_for_execution()
 
     def terminate(self):
         """Gracefully terminate the running FFmpeg process.
@@ -219,41 +244,43 @@ class FFmpeg(EventEmitter):
             # On Windows, SIGTERM is an alias for TerminateProcess().
             # To gracefully terminate the FFmpeg process, we should use CTRL_BREAK_EVENT signal.
             # References:
-            # - https://docs.python.org/3/library/subprocess.html#subprocess.Popen.send_signal
+            # - https://docs.python.org/3.10/library/subprocess.html#subprocess.Popen.send_signal
             # - https://github.com/FFmpeg/FFmpeg/blob/release/5.1/fftools/ffmpeg.c#L371
             sigterm = signal.CTRL_BREAK_EVENT  # type: ignore
 
         self._terminated = True
         self._process.send_signal(sigterm)
 
-    def _write_stdin(self, stream: Optional[IO[bytes]]):
+    async def _write_stdin(self, stream: Optional[asyncio.StreamReader]):
         if stream is None:
             return
 
         assert self._process.stdin is not None
 
-        for chunk in read_stream(stream, size=io.DEFAULT_BUFFER_SIZE):
+        async for chunk in read_stream(stream, size=io.DEFAULT_BUFFER_SIZE):
             self._process.stdin.write(chunk)
+            await self._process.stdin.drain()
 
-        self._process.stdin.flush()
         self._process.stdin.close()
+        await self._process.stdin.wait_closed()
 
-    def _read_stdout(self) -> bytes:
+    async def _read_stdout(self) -> bytes:
         assert self._process.stdout is not None
 
         buffer = bytearray()
-        for chunk in read_stream(self._process.stdout, size=io.DEFAULT_BUFFER_SIZE):
+        async for chunk in read_stream(self._process.stdout, size=io.DEFAULT_BUFFER_SIZE):
             buffer.extend(chunk)
 
-        self._process.stdout.close()
         return bytes(buffer)
 
-    def _handle_stderr(self) -> str:
+    async def _handle_stderr(self) -> str:
         assert self._process.stderr is not None
 
         line = b""
-        for line in readlines(self._process.stderr):
+        async for line in readlines(self._process.stderr):
             self.emit("stderr", line.decode())
 
-        self._process.stderr.close()
         return line.decode()
+
+    def _reraise_exception(self, exception: Exception):
+        raise exception
